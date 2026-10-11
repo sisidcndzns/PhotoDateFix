@@ -19,10 +19,12 @@ import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.exifinterface.media.ExifInterface
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.Executors
 
 data class Doc(val uri: Uri, val docId: String, val name: String, val lastModified: Long)
@@ -38,6 +40,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvOut: TextView
     private lateinit var tvLog: TextView
     private lateinit var tvStatus: TextView
+    private lateinit var etOff: EditText
     private lateinit var btnRun: Button
     private lateinit var cbSub: CheckBox
     private lateinit var rbOverwrite: RadioButton
@@ -53,7 +56,15 @@ class MainActivity : AppCompatActivity() {
     private var sortedKeys: List<String> = emptyList()
 
     private val ORIG = ExifInterface.TAG_DATETIME_ORIGINAL
+    private val DIG = ExifInterface.TAG_DATETIME_DIGITIZED
+    private val DT = ExifInterface.TAG_DATETIME
+    private val OFF_T = ExifInterface.TAG_OFFSET_TIME
     private val OFF_ORIG = ExifInterface.TAG_OFFSET_TIME_ORIGINAL
+    private val OFF_DIG = ExifInterface.TAG_OFFSET_TIME_DIGITIZED
+    private val SUB_T = ExifInterface.TAG_SUBSEC_TIME
+    private val SUB_ORIG = ExifInterface.TAG_SUBSEC_TIME_ORIGINAL
+    private val SUB_DIG = ExifInterface.TAG_SUBSEC_TIME_DIGITIZED
+    private val XHDR = "http://ns.adobe.com/xap/1.0/\u0000".toByteArray(Charsets.ISO_8859_1)
     private val dateTags = listOf(
         ExifInterface.TAG_DATETIME_ORIGINAL, ExifInterface.TAG_DATETIME_DIGITIZED, ExifInterface.TAG_DATETIME,
         ExifInterface.TAG_OFFSET_TIME, ExifInterface.TAG_OFFSET_TIME_ORIGINAL, ExifInterface.TAG_OFFSET_TIME_DIGITIZED,
@@ -169,9 +180,39 @@ class MainActivity : AppCompatActivity() {
         page.addView(folderCard("1", "원본 사진 폴더", "촬영 날짜가 정확한 원본 사진이 있는 폴더", tvOrig) { pickOriginal.launch(null) })
         page.addView(folderCard("2", "수정된 사진 폴더", "날짜를 고칠 수정본 사진이 있는 폴더", tvEdit) { pickEdited.launch(null) })
 
-        // 3. 저장 방식
+        // 3. 시간대 변환
+        val tzCard = card()
+        tzCard.addView(stepHeader("3", "변환할 시간대 (오프셋)"))
+        tzCard.addView(tv("원본의 실제 촬영 순간(UTC)을 구한 뒤, 이 시간대의 현지 시각으로 바꿔 EXIF·XMP 전체에 통일해 기록합니다.\n예) 런던 9월 +01:00 · 한국 +09:00", 13f, cMuted, false)
+            .apply { setPadding(0, dp(8), 0, 0) })
+        etOff = EditText(this).apply {
+            setText("+01:00"); setTextColor(cText); textSize = 16f; setSingleLine(true)
+            background = rounded(cBg, 10)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) }
+        }
+        tzCard.addView(etOff)
+        val chips = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) }
+        }
+        listOf("+01:00", "+00:00", "+02:00", "+09:00").forEach { o ->
+            chips.addView(Button(this).apply {
+                text = o; isAllCaps = false; textSize = 13f
+                setTextColor(cAccent)
+                background = rounded(cSoft, 10)
+                stateListAnimator = null
+                minHeight = dp(40)
+                layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(6) }
+                setOnClickListener { etOff.setText(o) }
+            })
+        }
+        tzCard.addView(chips)
+        page.addView(tzCard)
+
+        // 4. 저장 방식
         val modeCard = card()
-        modeCard.addView(stepHeader("3", "저장 방식"))
+        modeCard.addView(stepHeader("4", "저장 방식"))
         val rg = RadioGroup(this).apply { setPadding(0, dp(8), 0, 0) }
         rbOverwrite = RadioButton(this).apply {
             id = View.generateViewId(); text = "수정본 폴더에 같은 이름으로 덮어쓰기"
@@ -310,45 +351,139 @@ class MainActivity : AppCompatActivity() {
         return m
     }
 
-    /** 원본에서 수정본에 쓸 날짜 정보. 원본에 없는 오프셋/밀리초 태그는 null(=수정본에서 삭제) */
-    private fun readDates(doc: Doc): Map<String, String?>? {
-        val m = HashMap<String, String?>(readExif(doc))
-        val base: String = m[ExifInterface.TAG_DATETIME_ORIGINAL]
-            ?: m[ExifInterface.TAG_DATETIME_DIGITIZED]
-            ?: m[ExifInterface.TAG_DATETIME]
-            ?: run {
-                if (doc.lastModified <= 0) return null
-                SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(Date(doc.lastModified))
+    private class Plan(val utc: Long, val dto: String, val off: String, val sub: String?, val iso: String, val fallback: Boolean)
+
+    private fun offMin(s: String?): Int? {
+        val t = s?.trim() ?: return null
+        val m = Regex("^([+-])(\\d{2}):?(\\d{2})$").find(t) ?: return null
+        val v = m.groupValues[2].toInt() * 60 + m.groupValues[3].toInt()
+        return if (m.groupValues[1] == "-") -v else v
+    }
+
+    private fun offStr(min: Int): String {
+        val a = Math.abs(min)
+        return (if (min < 0) "-" else "+") + String.format(Locale.US, "%02d:%02d", a / 60, a % 60)
+    }
+
+    private fun utcFmt(pattern: String) = SimpleDateFormat(pattern, Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }
+
+    /** 원본의 (촬영시각 − 오프셋)으로 실제 순간(UTC)을 구하고, 목표 오프셋의 현지 시각으로 변환 */
+    private fun buildPlan(orig: Doc, tgtOff: String): Plan? {
+        val tgt = offMin(tgtOff) ?: return null
+        val ex = readExif(orig)
+        val dto = ex[ORIG] ?: ex[DIG] ?: ex[DT]
+        var fallback = false
+        val utc: Long
+        if (dto == null) {
+            if (orig.lastModified <= 0) return null
+            utc = orig.lastModified; fallback = true
+        } else {
+            val l = utcFmt("yyyy:MM:dd HH:mm:ss").parse(dto.take(19))?.time ?: return null
+            val om = offMin(ex[OFF_ORIG] ?: ex[OFF_T] ?: ex[OFF_DIG])
+            if (om != null) {
+                utc = l - om * 60000L
+            } else {
+                utc = l - tgt * 60000L; fallback = true
             }
-        m[ExifInterface.TAG_DATETIME_ORIGINAL] = m[ExifInterface.TAG_DATETIME_ORIGINAL] ?: base
-        m[ExifInterface.TAG_DATETIME_DIGITIZED] = m[ExifInterface.TAG_DATETIME_DIGITIZED] ?: base
-        m[ExifInterface.TAG_DATETIME] = m[ExifInterface.TAG_DATETIME] ?: base
-        return m
+        }
+        val local = Date(utc + tgt * 60000L)
+        val dtoOut = utcFmt("yyyy:MM:dd HH:mm:ss").format(local)
+        val sub = ex[SUB_ORIG] ?: ex[SUB_T]
+        val off = offStr(tgt)
+        val iso = utcFmt("yyyy-MM-dd'T'HH:mm:ss").format(local) + (if (sub != null) ".$sub" else "") + off
+        return Plan(utc, dtoOut, off, sub, iso, fallback)
     }
 
-    private fun isSame(cur: Map<String, String?>, want: Map<String, String?>): Boolean =
-        cur[ORIG] == want[ORIG] && cur[OFF_ORIG] == want[OFF_ORIG]
+    private fun datesOf(p: Plan): Map<String, String?> = mapOf(
+        ORIG to p.dto, DIG to p.dto, DT to p.dto,
+        OFF_T to p.off, OFF_ORIG to p.off, OFF_DIG to p.off,
+        SUB_T to p.sub, SUB_ORIG to p.sub, SUB_DIG to p.sub
+    )
 
-    private fun parseMillis(d: Map<String, String?>): Long? {
-        val date = d[ORIG] ?: return null
-        val off = d[OFF_ORIG] ?: d[ExifInterface.TAG_OFFSET_TIME]
-        return try {
-            if (off != null && Regex("[+-]\\d{2}:\\d{2}").matches(off))
-                SimpleDateFormat("yyyy:MM:dd HH:mm:ss XXX", Locale.US).parse("$date $off")?.time
-            else
-                SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).parse(date)?.time
-        } catch (_: Exception) { null }
+    private fun readHead(uri: Uri, max: Int): ByteArray? = try {
+        contentResolver.openInputStream(uri)?.use { s ->
+            val out = ByteArrayOutputStream()
+            val buf = ByteArray(65536)
+            var total = 0
+            while (total < max) {
+                val n = s.read(buf, 0, minOf(buf.size, max - total))
+                if (n < 0) break
+                out.write(buf, 0, n); total += n
+            }
+            out.toByteArray()
+        }
+    } catch (_: Exception) { null }
+
+    // ---- XMP ----
+    private class Xmp(val start: Int, val total: Int, val xml: String)
+
+    private fun findXmp(b: ByteArray): Xmp? {
+        var p = 2
+        while (p + 4 <= b.size && (b[p].toInt() and 0xFF) == 0xFF) {
+            val mk = b[p + 1].toInt() and 0xFF
+            if (mk == 0xFF) { p++; continue }
+            if (mk == 0xD9 || mk == 0xDA) break
+            if (mk == 0x01 || mk in 0xD0..0xD7) { p += 2; continue }
+            val len = ((b[p + 2].toInt() and 0xFF) shl 8) or (b[p + 3].toInt() and 0xFF)
+            if (mk == 0xE1 && p + 4 + XHDR.size <= b.size) {
+                var ok = true
+                for (i in XHDR.indices) { if (b[p + 4 + i] != XHDR[i]) { ok = false; break } }
+                if (ok) {
+                    val from = p + 4 + XHDR.size
+                    val end = minOf(p + 2 + len, b.size)
+                    return Xmp(p, 2 + len, String(b, from, end - from, Charsets.UTF_8))
+                }
+            }
+            p += 2 + len
+        }
+        return null
     }
 
-    /** 임시 파일에서 EXIF를 고친 뒤 대상에 통째로 덮어씀(잘라쓰기) */
-    private fun writeFixed(src: Doc, dst: Uri, dates: Map<String, String?>) {
+    private fun xmpCreate(xml: String): String? =
+        Regex("xmp:CreateDate\\s*=\\s*\"([^\"]*)\"").find(xml)?.groupValues?.get(1)
+            ?: Regex("<xmp:CreateDate>([^<]*)<").find(xml)?.groupValues?.get(1)
+
+    private fun setXmpDates(b: ByteArray, iso: String): ByteArray {
+        val s = findXmp(b) ?: return b
+        var xml = s.xml
+        for (n in listOf("xmp:CreateDate", "photoshop:DateCreated", "exif:DateTimeOriginal", "exif:DateTimeDigitized")) {
+            val q = Regex.escape(n)
+            xml = Regex("(" + q + "\\s*=\\s*\")[^\"]*(\")").replace(xml) { it.groupValues[1] + iso + it.groupValues[2] }
+            xml = Regex("(<" + q + ">)[^<]*(</" + q + ">)").replace(xml) { it.groupValues[1] + iso + it.groupValues[2] }
+        }
+        val body = xml.toByteArray(Charsets.UTF_8)
+        val len = 2 + XHDR.size + body.size
+        if (len > 65535) return b
+        val out = ByteArrayOutputStream(b.size + 1024)
+        out.write(b, 0, s.start)
+        out.write(0xFF); out.write(0xE1); out.write(len shr 8); out.write(len and 0xFF)
+        out.write(XHDR); out.write(body)
+        val restFrom = s.start + s.total
+        if (restFrom < b.size) out.write(b, restFrom, b.size - restFrom)
+        return out.toByteArray()
+    }
+
+    /** 수정본이 이미 목표 시간(EXIF+XMP)과 같은지 */
+    private fun isSame(ed: Doc, p: Plan): Boolean {
+        val cur = readExif(ed)
+        if (cur[ORIG] != p.dto || cur[OFF_ORIG] != p.off) return false
+        val head = readHead(ed.uri, 1 shl 20) ?: return true
+        val x = if (head.size > 2) findXmp(head) else null
+        val c = if (x != null) xmpCreate(x.xml) else null
+        return c == null || c == p.iso
+    }
+
+    /** 임시 파일에서 EXIF·XMP를 고친 뒤 대상에 통째로 덮어씀(잘라쓰기) */
+    private fun writeFixed(src: Doc, dst: Uri, p: Plan) {
         val tmp = File.createTempFile("pdf", ".img", cacheDir)
         try {
             contentResolver.openInputStream(src.uri)!!.use { i -> tmp.outputStream().use { i.copyTo(it) } }
             val ex = ExifInterface(tmp.absolutePath)
-            for ((k, v) in dates) ex.setAttribute(k, v)
+            for ((k, v) in datesOf(p)) ex.setAttribute(k, v)
             ex.saveAttributes()
-            contentResolver.openOutputStream(dst, "wt")!!.use { o -> tmp.inputStream().use { it.copyTo(o) } }
+            var bytes = tmp.readBytes()
+            if (bytes.size > 2 && bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte()) bytes = setXmpDates(bytes, p.iso)
+            contentResolver.openOutputStream(dst, "wt")!!.use { it.write(bytes) }
         } finally { tmp.delete() }
     }
 
@@ -381,6 +516,8 @@ class MainActivity : AppCompatActivity() {
         if (copyMode && out == null) { Toast.makeText(this, "저장 폴더를 선택하세요", Toast.LENGTH_SHORT).show(); return }
         val overwrite = !copyMode || out == e
         val recursive = cbSub.isChecked
+        val tgtOff = etOff.text.toString().trim()
+        if (offMin(tgtOff) == null) { Toast.makeText(this, "오프셋 형식이 올바르지 않습니다. 예: +01:00", Toast.LENGTH_LONG).show(); return }
         btnRun.isEnabled = false; btnRun.alpha = 0.4f
         tvLog.text = ""
         executor.execute {
@@ -423,37 +560,38 @@ class MainActivity : AppCompatActivity() {
                 edits.forEachIndexed { i, ed ->
                     try {
                         val orig = findOriginal(ed.name, map)
-                        val dates = if (orig != null) readDates(orig) else null
-                        val cur = readExif(ed)
-                        val millis = if (dates != null) parseMillis(dates) else null
-                        val needFix = dates != null && !isSame(cur, dates)
+                        val plan = if (orig != null) buildPlan(orig, tgtOff) else null
+                        val needFix = plan != null && !isSame(ed, plan)
                         if (needFix) {
+                            val p = plan!!
+                            val cur = readExif(ed)
                             val dst = target(ed)
                             try {
-                                writeFixed(ed, dst, dates!!)
+                                writeFixed(ed, dst, p)
                                 changed++
-                                log("✔ ${ed.name} ← ${orig!!.name}: ${cur[ORIG] ?: "날짜없음"} → ${dates[ORIG]}")
+                                log("✔ ${ed.name} ← ${orig!!.name}: ${cur[ORIG] ?: "없음"}${cur[OFF_ORIG] ?: ""} → ${p.dto}${p.off}" +
+                                    (if (p.fallback) " ⚠원본 오프셋 없음" else ""))
                             } catch (fe: Exception) {
                                 if (overwrite) throw fe
                                 copyPlain(ed, dst); copied++
                                 log("⚠ 날짜 쓰기 실패(${fe.message}) → 그대로 복사: ${ed.name}")
                             }
-                            finish(dst, millis)
+                            finish(dst, p.utc)
                         } else if (overwrite) {
                             when {
                                 orig == null -> { noMatch++; log("⚠ 매칭 없음: ${ed.name}") }
-                                dates == null -> { fail++; log("✖ 원본 날짜 없음: ${orig.name}") }
-                                else -> { same++; log("＝ 이미 같은 날짜(건너뜀): ${ed.name}") }
+                                plan == null -> { fail++; log("✖ 원본 날짜 없음: ${orig.name}") }
+                                else -> { same++; log("＝ 이미 같은 시간(건너뜀): ${ed.name}") }
                             }
                         } else {
                             val dst = target(ed)
                             copyPlain(ed, dst)
-                            finish(dst, millis ?: ed.lastModified.takeIf { it > 0 })
+                            finish(dst, plan?.utc ?: ed.lastModified.takeIf { it > 0 })
                             copied++
                             log(when {
                                 orig == null -> "➕ 원본에 없음 → 그대로 복사: ${ed.name}"
-                                dates == null -> "➕ 원본 날짜 없음 → 그대로 복사: ${ed.name}"
-                                else -> "＝ 같은 날짜 → 복사: ${ed.name}"
+                                plan == null -> "➕ 원본 날짜 없음 → 그대로 복사: ${ed.name}"
+                                else -> "＝ 같은 시간 → 복사: ${ed.name}"
                             })
                         }
                     } catch (ex: Exception) {
