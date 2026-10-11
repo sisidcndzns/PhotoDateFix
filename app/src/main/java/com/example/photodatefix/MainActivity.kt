@@ -138,11 +138,13 @@ class MainActivity : AppCompatActivity() {
                 for (t in dateTags) ex.getAttribute(t)?.let { m[t] = it }
             }
         } catch (_: Exception) { }
-        var base = m[ExifInterface.TAG_DATETIME_ORIGINAL] ?: m[ExifInterface.TAG_DATETIME_DIGITIZED] ?: m[ExifInterface.TAG_DATETIME]
-        if (base == null) {
-            if (doc.lastModified <= 0) return null
-            base = SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(Date(doc.lastModified))
-        }
+        val base: String = m[ExifInterface.TAG_DATETIME_ORIGINAL]
+            ?: m[ExifInterface.TAG_DATETIME_DIGITIZED]
+            ?: m[ExifInterface.TAG_DATETIME]
+            ?: run {
+                if (doc.lastModified <= 0) return null
+                SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(Date(doc.lastModified))
+            }
         m[ExifInterface.TAG_DATETIME_ORIGINAL] = m[ExifInterface.TAG_DATETIME_ORIGINAL] ?: base
         m[ExifInterface.TAG_DATETIME_DIGITIZED] = m[ExifInterface.TAG_DATETIME_DIGITIZED] ?: base
         m[ExifInterface.TAG_DATETIME] = m[ExifInterface.TAG_DATETIME] ?: base
