@@ -183,10 +183,10 @@ class MainActivity : AppCompatActivity() {
         // 3. 시간대 변환
         val tzCard = card()
         tzCard.addView(stepHeader("3", "변환할 시간대 (오프셋)"))
-        tzCard.addView(tv("원본의 실제 촬영 순간(UTC)을 구한 뒤, 이 시간대의 현지 시각으로 바꿔 EXIF·XMP 전체에 통일해 기록합니다.\n예) 런던 9월 +01:00 · 한국 +09:00", 13f, cMuted, false)
+        tzCard.addView(tv("원본의 실제 촬영 순간(UTC)을 구한 뒤, 이 시간대의 현지 시각으로 바꿔 EXIF·XMP 전체에 통일해 기록합니다.\n예) 한국 +09:00 · 런던 9월 +01:00 · 파리 9월 +02:00", 13f, cMuted, false)
             .apply { setPadding(0, dp(8), 0, 0) })
         etOff = EditText(this).apply {
-            setText("+01:00"); setTextColor(cText); textSize = 16f; setSingleLine(true)
+            setText("+09:00"); setTextColor(cText); textSize = 16f; setSingleLine(true)
             background = rounded(cBg, 10)
             setPadding(dp(12), dp(10), dp(12), dp(10))
             layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) }
@@ -196,7 +196,7 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) }
         }
-        listOf("+01:00", "+00:00", "+02:00", "+09:00").forEach { o ->
+        listOf("+09:00", "+01:00", "+00:00", "+02:00").forEach { o ->
             chips.addView(Button(this).apply {
                 text = o; isAllCaps = false; textSize = 13f
                 setTextColor(cAccent)
